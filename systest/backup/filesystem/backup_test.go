@@ -353,7 +353,6 @@ func TestBackupFilesystem(t *testing.T) {
 	// Verify that there is no data for predicate `name`
 	verifyUids(0)
 
-	//TODO(Ahsan): What do we do for a deleted backup directory?
 	// Remove the full backup testDirs and verify restore catches the error.
 	require.NoError(t, os.RemoveAll(dirs[0]))
 	require.NoError(t, os.RemoveAll(dirs[3]))
@@ -409,11 +408,6 @@ func runBackupInternal(t *testing.T, forceFull bool, numExpectedFiles,
 		return isdir && strings.HasPrefix(path, "data/backups_copy/dgraph.")
 	})
 	require.Equal(t, numExpectedDirs, len(dirs))
-
-	// manifests := x.WalkPathFunc(copyBackupDir, func(path string, isdir bool) bool {
-	// 	return !isdir && strings.Contains(path, "manifest.json") && strings.HasPrefix(path, "data/backups_copy/dgraph.")
-	// })
-	// require.Equal(t, numExpectedDirs, len(manifests))
 
 	return dirs
 }

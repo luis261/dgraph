@@ -264,8 +264,6 @@ func TestBackupMinio(t *testing.T) {
 		require.EqualValues(t, check.expected, restored[incr4.Uids[check.blank]])
 	}
 
-	// TODO(Ahsan): Make minio backup correctly handle the case of a deleted backup dir.
-	// _ = dirs
 	// Remove the full backup dirs and verify restore catches the error.
 	require.NoError(t, os.RemoveAll(dirs[0]))
 	require.NoError(t, os.RemoveAll(dirs[3]))
@@ -331,14 +329,8 @@ func runRestore(t *testing.T, lastDir string, commitTs uint64) map[string]string
 	require.NoError(t, os.RemoveAll(restoreDir))
 
 	t.Logf("--- Restoring from: %q", localBackupDst)
-	// argv := []string{"dgraph", "restore", "-l", localBackupDst, "-p", "data/restore",
-	// 	"--force_zero=false"}
-	// cwd, err := os.Getwd()
-	// require.NoError(t, err)
-	// err = testutil.ExecWithOpts(argv, testutil.CmdOpts{Dir: cwd})
-	// require.NoError(t, err)
-
-	result := worker.RunRestore("./data/restore", localBackupDst, lastDir, x.SensitiveByteSlice(nil), options.Snappy, 0)
+	result := worker.RunRestore("./data/restore", localBackupDst, lastDir,
+		x.SensitiveByteSlice(nil), options.Snappy, 0)
 	require.NoError(t, result.Err)
 
 	for i, pdir := range []string{"p1", "p2", "p3"} {
