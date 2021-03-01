@@ -17,11 +17,9 @@ import (
 	"io"
 	"net/url"
 	"sort"
-	"sync"
 
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/pkg/errors"
 )
@@ -76,8 +74,8 @@ type UriHandler interface {
 	// CreateBackupFile prepares the object or file to save the backup file.
 	CreateBackupFile(*url.URL, *pb.BackupRequest) error
 
-	// CreateManifest prepares the manifest for writing.
-	CreateManifest(*url.URL, *pb.BackupRequest) error
+	// WriteManifest writes the given manifest.
+	WriteManifest(*url.URL, *MasterManifest) error
 
 	// Load will scan location URI for backup files, then load them via loadFn.
 	// It optionally takes the name of the last directory to consider. Any backup directories
@@ -98,6 +96,8 @@ type UriHandler interface {
 	// ReadManifest will read the manifest at the given location and load it into the given
 	// Manifest object.
 	ReadManifest(string, *Manifest) error
+
+	GetManifest(*url.URL) (*MasterManifest, error)
 }
 
 // NewUriHandler parses the requested URI and finds the corresponding UriHandler.
@@ -154,6 +154,8 @@ func LoadBackup(location, backupId string, backupNum uint64, creds *x.MinioCrede
 	if err != nil {
 		return LoadResult{Err: errors.Errorf("Unsupported URI: %v", uri)}
 	}
+	fmt.Println("Uri schema: ", uri.Scheme)
+	fmt.Println("Load called")
 
 	return h.Load(uri, backupId, backupNum, fn)
 }
@@ -175,7 +177,7 @@ func VerifyBackup(req *pb.RestoreRequest, creds *x.MinioCredentials, currentGrou
 }
 
 // ListBackupManifests scans location l for backup files and returns the list of manifests.
-func ListBackupManifests(l string, creds *x.MinioCredentials) (map[string]*Manifest, error) {
+func ListBackupManifests(l string, creds *x.MinioCredentials) ([]*Manifest, error) {
 	uri, err := url.Parse(l)
 	if err != nil {
 		return nil, err
@@ -186,37 +188,11 @@ func ListBackupManifests(l string, creds *x.MinioCredentials) (map[string]*Manif
 		return nil, errors.Wrap(err, "ListBackupManifests")
 	}
 
-	paths, err := h.ListManifests(uri)
+	m, err := h.GetManifest(uri)
 	if err != nil {
 		return nil, err
 	}
-
-	res := struct {
-		sync.Mutex
-		listedManifests map[string]*Manifest
-	}{
-		listedManifests: make(map[string]*Manifest),
-	}
-
-	var g errgroup.Group
-	for _, path := range paths {
-		path := path // https://golang.org/doc/faq#closures_and_goroutines
-		g.Go(func() error {
-			var m Manifest
-			if err := h.ReadManifest(path, &m); err != nil {
-				return errors.Wrapf(err, "ReadManifest: path=%q", path)
-			}
-			m.Path = path
-			res.Lock()
-			res.listedManifests[path] = &m
-			res.Unlock()
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-	return res.listedManifests, nil
+	return m.Manifests, nil
 }
 
 // filterManifests takes a list of manifests and returns the list of manifests

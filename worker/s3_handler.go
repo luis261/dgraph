@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
 
@@ -83,12 +84,10 @@ func NewS3Handler(uri *url.URL, creds *x.MinioCredentials) (*s3Handler, error) {
 	return h, nil
 }
 
-func (h *s3Handler) createObject(uri *url.URL, req *pb.BackupRequest, mc *x.MinioClient,
-	objectName string) {
+func (h *s3Handler) createObject(uri *url.URL, mc *x.MinioClient, objectPath string) {
 
 	// The backup object is: folder1...folderN/dgraph.20181106.0113/r110001-g1.backup
-	object := filepath.Join(h.objectPrefix, fmt.Sprintf(backupPathFmt, req.UnixTs),
-		objectName)
+	object := filepath.Join(h.objectPrefix, objectPath)
 	glog.V(2).Infof("Sending data to %s blob %q ...", uri.Scheme, object)
 
 	h.cerr = make(chan error, 1)
@@ -98,29 +97,68 @@ func (h *s3Handler) createObject(uri *url.URL, req *pb.BackupRequest, mc *x.Mini
 	}()
 }
 
-// GetLatestManifest reads the manifests at the given URL and returns the
-// latest manifest.
-func (h *s3Handler) GetLatestManifest(uri *url.URL) (*Manifest, error) {
-	// Find the max Since value from the latest backup.
-	var lastManifest string
+func (h *s3Handler) masterManifestPath(uri *url.URL) string {
+	done := make(chan struct{})
+	defer close(done)
+	suffix := backupManifest
+	for object := range h.mc.ListObjects(h.bucketName, h.objectPrefix, false, done) {
+		if strings.HasSuffix(object.Key, suffix) {
+			return object.Key
+		}
+	}
+	return ""
+}
+
+func (h *s3Handler) getConsolidatedManifest(uri *url.URL) (*MasterManifest, error) {
+	var paths []string
 	done := make(chan struct{})
 	defer close(done)
 	suffix := "/" + backupManifest
 	for object := range h.mc.ListObjects(h.bucketName, h.objectPrefix, true, done) {
-		if strings.HasSuffix(object.Key, suffix) && object.Key > lastManifest {
-			lastManifest = object.Key
+		if strings.HasSuffix(object.Key, suffix) {
+			paths = append(paths, object.Key)
 		}
 	}
 
-	var m Manifest
-	if lastManifest == "" {
-		return &m, nil
-	}
+	sort.Strings(paths)
+	var mlist []*Manifest
+	var manifest MasterManifest
 
-	if err := h.ReadManifest(lastManifest, &m); err != nil {
-		return nil, err
+	for _, path := range paths {
+		var m Manifest
+		if err := h.ReadManifest(path, &m); err != nil {
+			return nil, errors.Wrap(err, "While Getting latest manifest")
+		}
+		m.Path = path
+		mlist = append(mlist, &m)
 	}
-	return &m, nil
+	manifest.Manifests = mlist
+	return &manifest, nil
+}
+
+// GetLatestManifest reads the manifests at the given URL and returns the
+// latest manifest.
+func (h *s3Handler) GetLatestManifest(uri *url.URL) (*Manifest, error) {
+
+	var manifest MasterManifest
+
+	path := h.masterManifestPath(uri)
+	// If there is no master manifest, create one using old manifests.
+	if path == "" {
+		m, err := h.getConsolidatedManifest(uri)
+		if err != nil {
+			return nil, errors.Wrap(err, "Get latest manifest failed while consolidation: ")
+		}
+		manifest.Manifests = m.Manifests
+	} else {
+		if err := h.readMasterManifest(path, &manifest); err != nil {
+			return nil, errors.Wrap(err, "Get latest manifest failed to read master manifest: ")
+		}
+	}
+	if len(manifest.Manifests) == 0 {
+		return &Manifest{}, nil
+	}
+	return manifest.Manifests[len(manifest.Manifests)-1], nil
 }
 
 // CreateBackupFile creates a new session and prepares the data stream for the backup.
@@ -132,61 +170,83 @@ func (h *s3Handler) GetLatestManifest(uri *url.URL) (*Manifest, error) {
 func (h *s3Handler) CreateBackupFile(uri *url.URL, req *pb.BackupRequest) error {
 	glog.V(2).Infof("S3Handler got uri: %+v. Host: %s. Path: %s\n", uri, uri.Host, uri.Path)
 
-	objectName := backupName(req.ReadTs, req.GroupId)
-	h.createObject(uri, req, h.mc, objectName)
+	fileName := backupName(req.ReadTs, req.GroupId)
+	objectPath := filepath.Join(fmt.Sprintf(backupPathFmt, req.UnixTs), fileName)
+	h.createObject(uri, h.mc, objectPath)
 	return nil
 }
 
 // CreateManifest finishes a backup by creating an object to store the manifest.
-func (h *s3Handler) CreateManifest(uri *url.URL, req *pb.BackupRequest) error {
+func (h *s3Handler) WriteManifest(uri *url.URL, manifest *MasterManifest) error {
 	glog.V(2).Infof("S3Handler got uri: %+v. Host: %s. Path: %s\n", uri, uri.Host, uri.Path)
 
-	h.createObject(uri, req, h.mc, backupManifest)
+	h.createObject(uri, h.mc, backupManifest)
+	if err := json.NewEncoder(h).Encode(manifest); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (h *s3Handler) GetManifest(uri *url.URL) (*MasterManifest, error) {
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+
+	suffix := backupManifest
+	var path string
+	for object := range h.mc.ListObjects(h.bucketName, h.objectPrefix, false, doneCh) {
+		fmt.Println("Walk: ", object.Key)
+		if strings.HasSuffix(object.Key, suffix) {
+			path = object.Key
+		}
+	}
+	var manifest MasterManifest
+	if path == "" {
+		m, err := h.getConsolidatedManifest(uri)
+		if err != nil {
+			return nil, errors.Wrap(err, "Get latest manifest failed while consolidation: ")
+		}
+		manifest.Manifests = m.Manifests
+	} else {
+		if err := h.readMasterManifest(path, &manifest); err != nil {
+			return nil, errors.Wrapf(err, "While reading master manifest %q", path)
+		}
+	}
+	return &manifest, nil
+
 }
 
 func (h *s3Handler) GetManifests(uri *url.URL, backupId string,
 	backupNum uint64) ([]*Manifest, error) {
 
-	var paths []string
-	doneCh := make(chan struct{})
-	defer close(doneCh)
-
-	suffix := "/" + backupManifest
-	for object := range h.mc.ListObjects(h.bucketName, h.objectPrefix, true, doneCh) {
-		if strings.HasSuffix(object.Key, suffix) {
-			paths = append(paths, object.Key)
+	var manifest MasterManifest
+	path := h.masterManifestPath(uri)
+	// If there is no master manifest, create one using old manifests.
+	if path == "" {
+		var err error
+		m, err := h.getConsolidatedManifest(uri)
+		if err != nil {
+			errors.Wrap(err, "Get manifests failed to get consolidated manifests: ")
+		}
+		manifest.Manifests = m.Manifests
+	} else {
+		if err := h.readMasterManifest(path, &manifest); err != nil {
+			return nil, errors.Wrap(err, "Get manifests failed: ")
 		}
 	}
-	if len(paths) == 0 {
-		return nil, errors.Errorf("No manifests found at: %s", uri.String())
-	}
-	sort.Strings(paths)
-
-	// Read and filter the manifests to get the list of manifests to consider
-	// for this restore operation.
-	var manifests []*Manifest
-	for _, path := range paths {
-		var m Manifest
-		if err := h.ReadManifest(path, &m); err != nil {
-			return nil, errors.Wrapf(err, "while reading %q", path)
-		}
-		m.Path = path
-		manifests = append(manifests, &m)
-	}
-
-	return getManifests(manifests, backupId, backupNum)
+	return getManifests(manifest.Manifests, backupId, backupNum)
 }
 
 // Load creates a new session, scans for backup objects in a bucket, then tries to
 // load any backup objects found.
 // Returns nil and the maximum Since value on success, error otherwise.
 func (h *s3Handler) Load(uri *url.URL, backupId string, backupNum uint64, fn loadFn) LoadResult {
+	fmt.Println("[Load] inside")
 	manifests, err := h.GetManifests(uri, backupId, backupNum)
 	if err != nil {
 		return LoadResult{Err: errors.Wrapf(err, "while retrieving manifests")}
 	}
 
+	spew.Dump("LOAD manifests", manifests)
 	// since is returned with the max manifest Since value found.
 	var since uint64
 
@@ -199,7 +259,11 @@ func (h *s3Handler) Load(uri *url.URL, backupId string, backupNum uint64, fn loa
 			continue
 		}
 
-		path := filepath.Dir(manifests[i].Path)
+		path := manifests[i].Path
+		fmt.Println("[Load] path before: ", path)
+		// _, path = filepath.Split(path)
+		// path = filepath.Join(uri.Path, path)
+		fmt.Println("[Load] path: ", path)
 		for gid := range manifest.Groups {
 			object := filepath.Join(path, backupName(manifest.Since, gid))
 			reader, err := h.mc.GetObject(h.bucketName, object, minio.GetObjectOptions{})
@@ -272,6 +336,15 @@ func (h *s3Handler) ListManifests(uri *url.URL) ([]string, error) {
 }
 
 func (h *s3Handler) ReadManifest(path string, m *Manifest) error {
+	reader, err := h.mc.GetObject(h.bucketName, path, minio.GetObjectOptions{})
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	return json.NewDecoder(reader).Decode(m)
+}
+
+func (h *s3Handler) readMasterManifest(path string, m *MasterManifest) error {
 	reader, err := h.mc.GetObject(h.bucketName, path, minio.GetObjectOptions{})
 	if err != nil {
 		return err
