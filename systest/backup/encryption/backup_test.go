@@ -304,7 +304,7 @@ func runRestore(t *testing.T, lastDir string, commitTs uint64) map[string]string
 
 	t.Logf("--- Restoring from: %q", localBackupDst)
 	testutil.KeyFile = "../../../ee/enc/test-fixtures/enc-key"
-	key, err := ioutil.ReadFile(testutil.keyFile)
+	key, err := ioutil.ReadFile(testutil.KeyFile)
 	require.NoError(t, err)
 	result := worker.RunRestore("./data/restore", localBackupDst, lastDir,
 		x.SensitiveByteSlice(key), options.Snappy, 0)
